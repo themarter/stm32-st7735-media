@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10191b">
+  <title>ST73 // LCD — STM32 彩屏控制台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+  <main>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">STM32F103 / ST7735 / WEB SERIAL</p>
+        <h1>ST73<span>//</span>LCD</h1>
+        <p class="subtitle">在浏览器转换媒体，通过串口把像素实时送到你的彩屏。</p>
+      </div>
+      <div class="connection">
+        <span class="dot" id="connection-dot"></span>
+        <span id="connection-label">未连接设备</span>
+        <button id="connect">连接串口</button>
+      </div>
+    </header>
+
+    <section class="hero-grid">
+      <section class="panel converter">
+        <div class="panel-head"><p>01 — 媒体转换</p><span id="media-kind">等待媒体</span></div>
+        <label id="drop-zone" class="drop-zone">
+          <input id="media-input" type="file" accept="image/*,video/*">
+          <span class="upload-mark">＋</span>
+          <strong>选择图片、GIF 或短视频</strong>
+          <span>动画按 12 FPS 采样，最多 120 帧（约 10 秒）。</span>
+          <span class="fine">图片转换在本地浏览器完成，不会上传到网站。</span>
+        </label>
+        <div class="preview-stage">
+          <div class="screen-frame">
+            <canvas id="preview" width="128" height="160" aria-label="ST7735 输出预览"></canvas>
+          </div>
+          <div class="preview-overlay"><span id="preview-resolution">128 × 160</span><span>RGB565</span></div>
+        </div>
+        <div class="metrics">
+          <div><small>输出分辨率</small><b id="canvas-size">128 × 160</b></div>
+          <div><small>媒体帧数</small><b id="frame-count">—</b></div>
+          <div><small>媒体包大小</small><b id="output-size">—</b></div>
+        </div>
+      </section>
+
+      <aside class="panel controls">
+        <div class="panel-head"><p>02 — 屏幕设置</p><span>ST7735</span></div>
+        <label class="field">屏幕模组分辨率
+          <select id="resolution">
+            <option value="128x160" selected>128 × 160（常见 ST7735）</option>
+            <option value="160x128">160 × 128（横向模组）</option>
+            <option value="128x128">128 × 128（方形模组）</option>
+            <option value="160x80">160 × 80（窄屏模组）</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>显示方向</span>
+          <div class="orientation-grid" role="group" aria-label="显示方向">
+            <button class="orientation-choice active" data-orientation="0"><i class="mini-screen portrait"></i><span>竖屏正向</span></button>
+            <button class="orientation-choice" data-orientation="1"><i class="mini-screen landscape"></i><span>横屏正向</span></button>
+            <button class="orientation-choice" data-orientation="2"><i class="mini-screen portrait reverse"></i><span>竖屏倒转</span></button>
+            <button class="orientation-choice" data-orientation="3"><i class="mini-screen landscape reverse"></i><span>横屏倒转</span></button>
+          </div>
+        </div>
+        <label class="field">动画采样帧率
+          <select id="fps">
+            <option value="6">6 FPS（串口较慢时）</option>
+            <option value="8">8 FPS</option>
+            <option value="12" selected>12 FPS</option>
+          </select>
+        </label>
+        <p class="hint">网页根据选择的画幅重新裁剪媒体。ST7735 通常使用 SPI；这里的串口只负责传输图像数据，并不是 LCD 的 SCL/SDA 引脚。</p>
+        <div class="actions">
+          <button id="send" class="primary" disabled>实时投屏</button>
+          <button id="stop" class="quiet" disabled>停止动画</button>
+        </div>
+        <button id="export" class="wide quiet" disabled>导出 .st73 媒体包</button>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <div class="progress-meta"><span id="progress-label">先选择媒体文件</span><span id="progress-percent"></span></div>
+      </aside>
+    </section>
+
+    <section class="panel guide">
+      <div class="panel-head"><p>03 — 连接与状态</p><span id="protocol-state">等待 STM32 接收端</span></div>
+      <div class="guide-grid">
+        <div><b>电脑 → 串口</b><p>需要 USB 转 TTL 串口模块，并使用 Chrome 或 Edge。网页在 HTTPS 或 localhost 下运行。</p></div>
+        <div><b>串口 → STM32</b><p>默认 921600、8-N-1。建议用 USART1：PA9 接模块 RX，PA10 接模块 TX，GND 共地。</p></div>
+        <div><b>STM32 → ST7735</b><p>需要烧录匹配的 ST73 接收协议。网页不能替代单片机固件；未安装接收端时，网页可以转换并导出媒体包，但不能直接让屏幕显示。</p></div>
+      </div>
+      <pre id="diagnostic-log" aria-live="polite">连接后会显示协议握手、传输速度和错误信息。</pre>
+    </section>
+    <footer><span>ST73//LCD · STM32F103 + ST7735</span><span>本地媒体转换 · RGB565 · 差分分块传输</span></footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
