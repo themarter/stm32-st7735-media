@@ -88,7 +88,7 @@
       <div class="guide-grid">
         <div><b>电脑 → 串口</b><p>需要 USB 转 TTL 串口模块，并使用 Chrome 或 Edge。网页在 HTTPS 或 localhost 下运行。</p></div>
         <div><b>串口 → STM32</b><p>默认 921600、8-N-1。建议用 USART1：PA9 接模块 RX，PA10 接模块 TX，GND 共地。</p></div>
-        <div><b>STM32 → ST7735</b><p>需要烧录匹配的 ST73 接收协议。网页不能替代单片机固件；未安装接收端时，网页可以转换并导出媒体包，但不能直接让屏幕显示。</p></div>
+        <div><b>STM32 → ST7735</b><p>Keil 工程已接入 ST7735 驱动和 ST73 串口接收端，并生成 HEX；尚未烧录实机验证。连接前请先把 HEX 写入 STM32。</p></div>
       </div>
       <pre id="diagnostic-log" aria-live="polite">连接后会显示协议握手、传输速度和错误信息。</pre>
     </section>

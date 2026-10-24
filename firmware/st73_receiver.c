@@ -9,6 +9,7 @@
 #define ST73_CMD_HELLO       0x01u
 #define ST73_CMD_FRAME_BEGIN 0x10u
 #define ST73_CMD_FRAME_END   0x11u
+#define ST73_CMD_SESSION_STOP 0x12u
 
 #define ST73_EVT_ACK         0x80u
 #define ST73_EVT_HELLO       0x81u
@@ -317,6 +318,8 @@ static void st73_process_packet(ST73_Receiver *r, size_t encoded_len)
             } else {
                 r->frame_active = 0u;
             }
+        } else if (payload_len == 1u && payload[0] == ST73_CMD_SESSION_STOP) {
+            r->frame_active = 0u;
         } else {
             status = ST73_STATUS_BAD_COMMAND;
         }

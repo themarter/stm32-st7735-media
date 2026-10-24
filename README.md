@@ -1,32 +1,35 @@
-# ST73 // LCD — STM32 + ST7735
+# ST73 // LCD — STM32F103 + ST7735
 
-面向 STM32F103 + ST7735 的浏览器媒体转换和串口投屏工具。此仓库只包含这个独立工具，不复制原私有仓库中的 ESP32 工程。
+浏览器端图片、GIF、视频转 RGB565，并通过 USB-TTL 串口发送给 **STM32F103C8 + ST7735**。网页只负责媒体处理和串口传输，不直接控制 LCD 引脚。
 
 ## 在线体验
 
-部署后地址：<https://themarter.github.io/stm32-st7735/>
+<https://themarter.github.io/stm32-st7735-media/>
 
-## 功能
+## 当前功能
 
 - 本地转换 PNG、JPEG、WebP、GIF 与短视频为 RGB565。
-- 支持 128×160、160×128、128×128、160×80 画幅以及四种显示方向。
+- 支持 128×160、160×128、128×128、160×80 画幅和四种方向。
 - 16×16 tile 差分、RLE 压缩、离线导出 `.st73` 媒体包。
 - Web Serial 实时传输，默认 921600 baud、8-N-1。
-- 纯 C 协议接收端：COBS、CRC-32、握手/ACK、RGB565 tile 解码。无需固定 HAL 或 LL。
+- C 接收协议：COBS、CRC-32、握手/ACK、RGB565 tile 解码；不缓存 40 KiB 的整屏帧缓冲，适配 STM32F103C8 的 20 KiB SRAM。
 
-所有媒体转换均在浏览器本地进行。实时显示还要求 STM32 烧录并集成本仓库的接收模块，以及你现有的 ST7735 绘图回调。
+## 你的实际接线
 
-## 本地运行网页
+LCD 与 USB-TTL 是两组不同的线路。
 
-在仓库根目录执行：
+| ST7735 | STM32F103C8 |
+| --- | --- |
+| SCL / CLK | PB10 |
+| SDA / DIO | PB11 |
+| DC | PB0 |
+| RES | PB1 |
+| CS | PA7 |
+| BL / LED | PA6 |
 
-    py -m http.server 8000
+屏幕驱动使用 PB10/PB11 GPIO 模拟 SPI 时序；**不是 I²C，也不是 ESP32**。
 
-然后用最新版 Chrome/Edge 打开 <http://localhost:8000>。Web Serial 要求 HTTPS 或 localhost；浏览器会要求你主动选择串口。
-
-## 接线
-
-请使用 3.3 V 逻辑电平 USB-TTL，并共地：
+USB-TTL（3.3 V 逻辑电平、必须共地）：
 
 | USB-TTL | STM32F103C8 |
 | --- | --- |
@@ -34,19 +37,34 @@
 | RX | PA9 / USART1_TX |
 | GND | GND |
 
-UART 两侧均设为 921600、8-N-1。若模块无法稳定使用此波特率，请同时修改网页的 `state.baud` 与 MCU UART 配置。
+串口设置为 921600、8-N-1。网页的串口只传图像数据，STM32 再通过 PB10/PB11 驱动 ST7735。
 
-LCD 接线仍与你之前确认的一致：SCL=PB10、SDA=PB11、DC=PB0。这些 LCD 引脚与 USB-TTL 的串口引脚用途不同；以你真实模组和驱动为准，勿将它们当作 UART 接线。
+## Keil 工程集成
 
-## 集成接收端
+本次已把以下代码加入本地 Keil 工程 `C:\Users\11695\Desktop\stm32project\模块`：
 
-- `firmware/st73_receiver.h` / `.c`：可移植协议接收实现。
-- `firmware/PROTOCOL.md`：串口 packet、控制命令、tile 格式。
-- `firmware/test_receiver.c`：主机侧协议测试。
+- `my_lib/st7735.c`、`my_lib/st7735.h`：ST7735 初始化、RGB565 矩形/像素绘制、方向切换。
+- `my_lib/st73_receiver.c`、`my_lib/st73_receiver.h`：串口投屏协议接收、分块解码和 ACK。
+- `user/main.c`：USART1 921600 RX 中断 + 4096 字节环形队列；中断只收字节，主循环解析协议并绘制，避免在中断里阻塞刷屏。
 
-将两个 receiver 文件加入 Keil 工程，创建静态 `ST73_Receiver` 实例，调用 `st73_receiver_init()`，并实现 `draw_tile`、可选的 `set_orientation` 和 `uart_write` 回调。示例里的 `ST7735_DrawRGB565` 与 `UART1_Write` 都是占位函数名，必须换成你的真实驱动 API。UART 接收中断/DMA 只负责收集字节，在主循环调用 `st73_receiver_feed()`，不要在中断里运行阻塞式 LCD 绘图。
+没有收到网页串口数据时，主程序运行彩色方块移动测试；收到串口数据后，移动测试停止，让媒体画面控制屏幕。断开投屏后会保留最后一帧。
 
-接收端不缓存整幅屏幕。128×160 的 RGB565 framebuffer 需要约 40 KiB，已超过 STM32F103C8 的 20 KiB SRAM；模块会解压一个 tile 并立即交给绘图回调。
+## 构建与验证状态
+
+当前已用 ARMCC 5.06 编译主程序、ST7735 驱动和接收器，并成功链接生成：
+
+- `Objects/template.axf`
+- `Objects/template.hex`
+
+这是软件构建验证，不等于实机显示验证。当前电脑检测到 USB-SERIAL CH340K（COM6），没有检测到 ST-LINK；因此尚未把 HEX 烧录到芯片，也未声称屏幕已经显示成功。原始主程序和工程文件保存在 `backup_pre_st7735_20261024`，动画测试版保存在 `backup_pre_stream_20261024`。
+
+## 本地运行网页
+
+在仓库根目录执行：
+
+    py -m http.server 8000
+
+然后用最新版 Chrome/Edge 打开 <http://localhost:8000>。Web Serial 需要 HTTPS 或 localhost，点击“连接 STM32”后由你选择串口。
 
 ## 协议自测
 
@@ -55,4 +73,4 @@ LCD 接线仍与你之前确认的一致：SCL=PB10、SDA=PB11、DC=PB0。这些
     gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/test_receiver.c -o st73_test.exe
     .\st73_test.exe
 
-测试覆盖 COBS/CRC、HELLO、分片 UART 输入、RGB565 tile、ACK 和 FRAME_END。主机测试通过不代表已在实体屏幕上验证；实际使用前仍需将回调接入你自己的 LCD 驱动并联调。
+主机协议测试通过不代表已在实体屏幕上验证。显示效果还会受到 ST7735 模组版本、可视区域偏移和屏幕方向设置影响。
