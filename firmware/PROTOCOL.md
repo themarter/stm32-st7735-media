@@ -1,68 +1,83 @@
-# OLED STREAM Protocol v1
+# ST73 Protocol v1
 
-本协议按 SSD1306 128×64、单色 1-bit 页缓冲设计。它不是 ST7735/RGB565 协议。
-
-## 物理链路
-
-- PC browser → USB-TTL → STM32 USART1：115200 baud，8-N-1。
-- STM32 → SSD1306 OLED：I²C，由现有 OLED 驱动负责刷新。
-- 一帧显示内容固定 1,024 字节；byte index 为 page × 128 + x；bit 0 对应该 page 顶部像素 y % 8 == 0。这与工程中 OLED->pBuffer[x + y/8*128] 的存储方式一致。
+本文对应本目录中的 app.js 和 st73_receiver.c。多字节数值均为 little-endian，除非标明 RGB565 像素数据为 big-endian。串口 8-N-1，默认 921600 baud。
 
 ## Wire packet
 
-raw packet：
+每个 packet 结构为：
 
-- channel: uint8（0=控制，1=画面数据，2=响应）
+- channel: uint8（0=控制，1=tile 数据，2=设备事件/响应）
 - sequence: uint16 LE
-- payload: 通道 1 的 payload 最多 260 字节（4 字节帧 ID/偏移头 + 256 字节画面数据），其他控制 payload 更短
-- crc32: uint32 LE，CRC-32/ISO-HDLC，反射多项式 0xEDB88320、初值/final XOR 均为 0xFFFFFFFF；校验 channel、sequence、payload
+- payload: 0 至 1800 字节（由 web sender 限制）
+- crc32: uint32 LE；对 channel、sequence 和 payload 计算 CRC-32/ISO-HDLC（反射多项式 0xEDB88320，初值 0xFFFFFFFF，最终 XOR 0xFFFFFFFF）
 
-raw packet 经 COBS 编码，前后各加 0x00 分隔。ACK 使用请求相同的 sequence，并从 channel 2 返回。
+raw packet 经 COBS 编码，前后各加 0x00 作为分隔符。接收端遇到 0x00 就结束当前编码片段；连续分隔符产生的空片段忽略。响应复用请求的 sequence，写入 channel 2，然后以同样格式返回。
 
-## Commands
+## Payload
 
-### HELLO — channel 0
+### HELLO — channel 0, command 0x01
 
-Request payload: [0x01].
+Request payload: one byte 01.
 
-Response payload, 6 bytes: [0x81, width_u16le, height_u16le, version]. 当前固定为 [0x81, 128, 0, 64, 0, 1]。
+Response payload: 6 bytes:
 
-### FRAME_BEGIN — channel 0
+- 0: 0x81 (HELLO event)
+- 1-2: panel width uint16 LE
+- 3-4: panel height uint16 LE
+- 5: protocol version (currently 1)
 
-Payload exactly 9 bytes:
-- byte 0: 0x10
-- bytes 1..2: frame ID uint16 LE
-- bytes 3..4: width uint16 LE (128)
-- bytes 5..6: height uint16 LE (64)
-- bytes 7..8: frame delay milliseconds uint16 LE
+### FRAME_BEGIN — channel 0, command 0x10
 
-成功开始新帧后应答 [0x80, 0]。如果已经有一帧正在接收，新 FRAME_BEGIN 会以新 frame ID 重新开始接收。
+Request payload is exactly 12 bytes:
 
-### FRAME_DATA — channel 1
+- 0: 0x10
+- 1-2: frame ID uint16 LE
+- 3-4: logical frame width uint16 LE
+- 5-6: logical frame height uint16 LE
+- 7: orientation 0/1/2/3
+- 8-9: frame delay in ms uint16 LE
+- 10-11: expected changed tile-record count uint16 LE
 
-Payload = frame ID uint16 LE + offset uint16 LE + 1..256 raw framebuffer bytes。偏移必须等于下一段尚未接收的位置，从 0 顺序递增；不可跳过、重叠或越过 1024。
+On success, ACK payload is [0x80, 0]. Error ACK is [0x80, status].
 
-正常应答 [0x80, 0]。
+### TILE_DATA — channel 1
 
-### FRAME_END — channel 0
+Payload begins with frame ID uint16 LE and chunk index uint16 LE, followed by one or more complete tile records. Chunk index starts at 0 for every frame and must increase by one. Sender never splits a tile record across packets.
 
-Payload exactly [0x11, frame ID uint16 LE]。只在已经接收到连续完整的 1,024 字节时成功。接收器先调用 display refresh 回调，再回复 [0x80, 0]。
+Each record:
 
-### SESSION_STOP — channel 0
+- x, y, width, height: 1 byte each
+- codec: 0=raw, 1=RLE
+- data length: uint16 LE
+- data bytes
 
-Payload [0x12]。结束投屏会话，使主程序可以恢复其它 OLED 页面；回复 [0x80, 0]。
+Raw codec stores width × height RGB565 pixels, each pixel high byte then low byte. RLE codec stores triples: run_minus_1, pixel_hi, pixel_lo; run length is run_minus_1 + 1. Decompression must yield exactly width × height pixels. A tile is at most 16×16 pixels and tile origins are multiples of 16; final row/column tiles may be smaller.
 
-## ACK status
+Every accepted packet gets ACK [0x80, 0].
+
+### FRAME_END — channel 0, command 0x11
+
+Request payload is exactly 3 bytes:
+
+- 0: 0x11
+- 1-2: frame ID uint16 LE
+
+Success requires that the number of accepted tile records match the count declared in FRAME_BEGIN. ACK payload is [0x80, 0].
+
+## ACK status codes
 
 - 0: success
 - 1: unknown command or unsupported channel
-- 2: no active frame or frame ID mismatch
-- 3: wrong geometry or malformed size
-- 4: invalid offset, sequence of data, CRC payload, or incomplete frame
-- 5: frame data exceeds the 1,024-byte page buffer
+- 2: no active frame / wrong frame ID / invalid state
+- 3: invalid frame dimensions, orientation, or tile rectangle
+- 4: malformed payload, chunk order, codec or RLE data
+- 5: tile count exceeds the count declared in FRAME_BEGIN
+- 6: FRAME_END tile count does not match declaration
 
-CRC 错误包不回复 ACK；浏览器会超时提示通信失败。
+A corrupted wire packet (including CRC mismatch) is dropped without ACK; the browser will time out and report a receive/connection problem.
 
-## Performance
+## STM32 implementation notes
 
-默认 4 FPS。每帧经 UART 发送 1,024 字节，然后 STM32 调用现有 OLED_SendBuffer() 通过 I²C 刷新。I²C 刷新耗时、UART 波特率和 USB-TTL 延迟决定实测帧率；网页并不直接控制 I²C 引脚。
+The receiver module expects integration callbacks and a display driver that can write rectangular windows. It does not manage SPI, ST7735 offsets, rotation registers, reset timing or backlight. The default hello dimensions are the configured panel dimensions, so the browser accepts those dimensions or their swapped orientation. Make sure the chosen module's visible area and orientation match the coordinate conventions of your ST7735 driver.
+
+The browser renders the first frame as a full update; later frames only include changed 16×16 tiles. At the start of each animation loop the first frame is sent as a full update again, so the receiver doesn't need a framebuffer or tile cache.
