@@ -1,83 +1,69 @@
-# ST73 Protocol v1
+# ST73-Lite 协议 v2
 
-本文对应本目录中的 app.js 和 st73_receiver.c。多字节数值均为 little-endian，除非标明 RGB565 像素数据为 big-endian。串口 8-N-1，默认 921600 baud。
+一条链路，只干一件事：**把一张 RGB565 图片推到 ST7735 的 DIO/CLK 上**。
 
-## Wire packet
+因为需求只有这一件，协议就只剩「一个帧头 + 一串像素」。没有握手、没有分块、没有差分、没有压缩、没有 CRC、没有逐包 ACK。
 
-每个 packet 结构为：
+## 串口参数
 
-- channel: uint8（0=控制，1=tile 数据，2=设备事件/响应）
-- sequence: uint16 LE
-- payload: 0 至 1800 字节（由 web sender 限制）
-- crc32: uint32 LE；对 channel、sequence 和 payload 计算 CRC-32/ISO-HDLC（反射多项式 0xEDB88320，初值 0xFFFFFFFF，最终 XOR 0xFFFFFFFF）
+- 波特率 921600（可在网页里降到 460800 / 230400 / 115200，但必须和固件 `LINK_BAUD` 一致）
+- 8 数据位、无校验、1 停止位
+- 单向为主：电脑只发，MCU 只在整帧结束后回 3 字节状态
 
-raw packet 经 COBS 编码，前后各加 0x00 作为分隔符。接收端遇到 0x00 就结束当前编码片段；连续分隔符产生的空片段忽略。响应复用请求的 sequence，写入 channel 2，然后以同样格式返回。
+## 帧格式
 
-## Payload
+```
+偏移  长度  含义
+0     1     0xA5          同步字 1
+1     1     0x5A          同步字 2
+2     1     0x01          命令：显示图片（当前只有这一个命令）
+3     2     宽度  W  小端
+5     2     高度  H  小端
+7     1     方向  0..3
+8     1     校验  字节 0..7 之和的低 8 位
+9     2*W*H 像素数据，RGB565，高字节在前
+```
 
-### HELLO — channel 0, command 0x01
+像素顺序是「从左到右、从上到下」，与 ST7735 的 `0x2C`（RAMWR）扫描方向一致。所以 MCU 端整帧只需要设置一次窗口，然后一路把字节怼进 DIO。
 
-Request payload: one byte 01.
+### 为什么是 9 字节头
 
-Response payload: 6 bytes:
+- 两个同步字节：上电或断线错位后，MCU 能自己找回头。
+- 校验和：一个字节，足以挡住串口噪声导致的假同步；比 CRC32 便宜得多。
+- W/H：让 MCU 知道这一帧有多少像素，不用靠超时判断结束。
+- 方向：网页改方向不必重烧固件。
 
-- 0: 0x81 (HELLO event)
-- 1-2: panel width uint16 LE
-- 3-4: panel height uint16 LE
-- 5: protocol version (currently 1)
+### MCU 回执（可选，3 字节）
 
-### FRAME_BEGIN — channel 0, command 0x10
+整帧收完后 MCU 回：
 
-Request payload is exactly 12 bytes:
+```
+0x5A 0xA5 <status>
+```
 
-- 0: 0x10
-- 1-2: frame ID uint16 LE
-- 3-4: logical frame width uint16 LE
-- 5-6: logical frame height uint16 LE
-- 7: orientation 0/1/2/3
-- 8-9: frame delay in ms uint16 LE
-- 10-11: expected changed tile-record count uint16 LE
+| status | 含义 |
+| --- | --- |
+| 0x00 | 整帧收完，已写屏 |
+| 0x01 | 尺寸超出面板，像素已丢弃 |
+| 0x02 | 帧中途被新的同步字打断，已放弃 |
 
-On success, ACK payload is [0x80, 0]. Error ACK is [0x80, status].
+网页收到就显示「屏幕已确认」；收不到只提示「未收到回执」，不算失败——回执只是诊断用的，链路本身是单向的。
 
-### TILE_DATA — channel 1
+## 尺寸与方向
 
-Payload begins with frame ID uint16 LE and chunk index uint16 LE, followed by one or more complete tile records. Chunk index starts at 0 for every frame and must increase by one. Sender never splits a tile record across packets.
+网页送出的 W×H 是**旋转之后**的尺寸。例如模组原生 128×160，选「横屏」时网页发 W=160、H=128，方向 1。
 
-Each record:
+MCU 端顺序是：`SetRotation(方向)` → 面板尺寸随之交换 → 校验 W/H 不超过面板 → 设置窗口。
 
-- x, y, width, height: 1 byte each
-- codec: 0=raw, 1=RLE
-- data length: uint16 LE
-- data bytes
+## 速度
 
-Raw codec stores width × height RGB565 pixels, each pixel high byte then low byte. RLE codec stores triples: run_minus_1, pixel_hi, pixel_lo; run length is run_minus_1 + 1. Decompression must yield exactly width × height pixels. A tile is at most 16×16 pixels and tile origins are multiples of 16; final row/column tiles may be smaller.
+128×160 一帧 = 40960 字节。
 
-Every accepted packet gets ACK [0x80, 0].
+- 串口 921600 8-N-1：约 0.45 s
+- PB10/PB11 软件 SPI（BSRR 直写，72 MHz）：约 1 µs/字节，整屏约 40 ms
 
-### FRAME_END — channel 0, command 0x11
+所以瓶颈在串口，写屏不会拖后腿。
 
-Request payload is exactly 3 bytes:
+## 和 v1 的区别
 
-- 0: 0x11
-- 1-2: frame ID uint16 LE
-
-Success requires that the number of accepted tile records match the count declared in FRAME_BEGIN. ACK payload is [0x80, 0].
-
-## ACK status codes
-
-- 0: success
-- 1: unknown command or unsupported channel
-- 2: no active frame / wrong frame ID / invalid state
-- 3: invalid frame dimensions, orientation, or tile rectangle
-- 4: malformed payload, chunk order, codec or RLE data
-- 5: tile count exceeds the count declared in FRAME_BEGIN
-- 6: FRAME_END tile count does not match declaration
-
-A corrupted wire packet (including CRC mismatch) is dropped without ACK; the browser will time out and report a receive/connection problem.
-
-## STM32 implementation notes
-
-The receiver module expects integration callbacks and a display driver that can write rectangular windows. It does not manage SPI, ST7735 offsets, rotation registers, reset timing or backlight. The default hello dimensions are the configured panel dimensions, so the browser accepts those dimensions or their swapped orientation. Make sure the chosen module's visible area and orientation match the coordinate conventions of your ST7735 driver.
-
-The browser renders the first frame as a full update; later frames only include changed 16×16 tiles. At the start of each animation loop the first frame is sent as a full update again, so the receiver doesn't need a framebuffer or tile cache.
+v1 想做 GIF 和视频实时投屏，于是有了 COBS、CRC32、tile 差分、RLE、双向 ACK、帧序列号。功能没验证通，复杂度先上去了。v2 全部删掉，回到「发一张图、点亮一块屏」。

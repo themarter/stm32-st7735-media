@@ -1,99 +1,167 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10191b">
-  <title>ST73 // LCD — STM32 彩屏控制台</title>
-  <link rel="stylesheet" href="styles.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c1214">
+<title>ST73 // LCD — 一张图送进 ST7735</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%230b1113'/%3E%3Crect x='7' y='6' width='18' height='20' rx='2' fill='none' stroke='%233fd8c2' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="scanlines" aria-hidden="true"></div>
-  <main>
-    <header class="masthead">
-      <div>
-        <p class="eyebrow">STM32F103 / ST7735 / WEB SERIAL</p>
-        <h1>ST73<span>//</span>LCD</h1>
-        <p class="subtitle">在浏览器转换媒体，通过串口把像素实时送到你的彩屏。</p>
-      </div>
-      <div class="connection">
-        <span class="dot" id="connection-dot"></span>
-        <span id="connection-label">未连接设备</span>
-        <button id="connect">连接串口</button>
-      </div>
-    </header>
+<div class="backdrop" aria-hidden="true"></div>
 
-    <section class="hero-grid">
-      <section class="panel converter">
-        <div class="panel-head"><p>01 — 媒体转换</p><span id="media-kind">等待媒体</span></div>
-        <label id="drop-zone" class="drop-zone">
-          <input id="media-input" type="file" accept="image/*,video/*">
-          <span class="upload-mark">＋</span>
-          <strong>选择图片、GIF 或短视频</strong>
-          <span>动画按 12 FPS 采样，最多 120 帧（约 10 秒）。</span>
-          <span class="fine">图片转换在本地浏览器完成，不会上传到网站。</span>
-        </label>
-        <div class="preview-stage">
-          <div class="screen-frame">
-            <canvas id="preview" width="128" height="160" aria-label="ST7735 输出预览"></canvas>
-          </div>
-          <div class="preview-overlay"><span id="preview-resolution">128 × 160</span><span>RGB565</span></div>
-        </div>
-        <div class="metrics">
-          <div><small>输出分辨率</small><b id="canvas-size">128 × 160</b></div>
-          <div><small>媒体帧数</small><b id="frame-count">—</b></div>
-          <div><small>媒体包大小</small><b id="output-size">—</b></div>
-        </div>
-      </section>
+<main>
+  <header class="masthead">
+    <div class="brand">
+      <p class="eyebrow">STM32F103C8 · ST7735 · DIO / CLK</p>
+      <h1>ST73<span>//</span>LCD</h1>
+      <p class="lede">
+        选一张图，转成 RGB565，顺着串口送进去。MCU 拿
+        <b>DIO</b> 和 <b>CLK</b> 两根线，一个字节一个字节刷上屏。
+      </p>
+    </div>
 
-      <aside class="panel controls">
-        <div class="panel-head"><p>02 — 屏幕设置</p><span>ST7735</span></div>
-        <label class="field">屏幕模组分辨率
-          <select id="resolution">
-            <option value="128x160" selected>128 × 160（常见 ST7735）</option>
-            <option value="160x128">160 × 128（横向模组）</option>
-            <option value="128x128">128 × 128（方形模组）</option>
-            <option value="160x80">160 × 80（窄屏模组）</option>
-          </select>
-        </label>
-        <div class="field">
-          <span>显示方向</span>
-          <div class="orientation-grid" role="group" aria-label="显示方向">
-            <button class="orientation-choice active" data-orientation="0"><i class="mini-screen portrait"></i><span>竖屏正向</span></button>
-            <button class="orientation-choice" data-orientation="1"><i class="mini-screen landscape"></i><span>横屏正向</span></button>
-            <button class="orientation-choice" data-orientation="2"><i class="mini-screen portrait reverse"></i><span>竖屏倒转</span></button>
-            <button class="orientation-choice" data-orientation="3"><i class="mini-screen landscape reverse"></i><span>横屏倒转</span></button>
-          </div>
+    <div class="link" id="link" data-state="idle">
+      <span class="link-dot"></span>
+      <div class="link-text">
+        <b id="link-label">串口未连接</b>
+        <small id="link-detail">需要 Chrome 或 Edge</small>
+      </div>
+      <button id="connect" class="ghost" type="button">连接串口</button>
+    </div>
+  </header>
+
+  <section class="layout">
+    <section class="card">
+      <div class="card-head">
+        <span>01 · 图片</span>
+        <em id="file-info">未选择</em>
+      </div>
+
+      <label class="drop" id="drop">
+        <input id="file" type="file" accept="image/*" hidden>
+        <strong>把图片拖进来，或点击选择</strong>
+        <span>PNG / JPEG / WebP / BMP · 全部在本地处理，不上传</span>
+      </label>
+
+      <div class="frame">
+        <div class="bezel">
+          <canvas id="canvas" width="128" height="160"></canvas>
         </div>
-        <label class="field">动画采样帧率
-          <select id="fps">
-            <option value="6">6 FPS（串口较慢时）</option>
-            <option value="8">8 FPS</option>
-            <option value="12" selected>12 FPS</option>
-          </select>
-        </label>
-        <p class="hint">网页根据选择的画幅重新裁剪媒体。ST7735 通常使用 SPI；这里的串口只负责传输图像数据，并不是 LCD 的 SCL/SDA 引脚。</p>
-        <div class="actions">
-          <button id="send" class="primary" disabled>实时投屏</button>
-          <button id="stop" class="quiet" disabled>停止动画</button>
-        </div>
-        <button id="export" class="wide quiet" disabled>导出 .st73 媒体包</button>
-        <div class="progress"><div id="progress-bar"></div></div>
-        <div class="progress-meta"><span id="progress-label">先选择媒体文件</span><span id="progress-percent"></span></div>
-      </aside>
+        <span class="frame-tag" id="frame-tag">128 × 160</span>
+      </div>
+
+      <dl class="stats">
+        <div><dt>输出分辨率</dt><dd id="stat-size">—</dd></div>
+        <div><dt>像素字节</dt><dd id="stat-bytes">—</dd></div>
+        <div><dt>预计传输</dt><dd id="stat-eta">—</dd></div>
+      </dl>
     </section>
 
-    <section class="panel guide">
-      <div class="panel-head"><p>03 — 连接与状态</p><span id="protocol-state">等待 STM32 接收端</span></div>
-      <div class="guide-grid">
-        <div><b>电脑 → 串口</b><p>需要 USB 转 TTL 串口模块，并使用 Chrome 或 Edge。网页在 HTTPS 或 localhost 下运行。</p></div>
-        <div><b>串口 → STM32</b><p>默认 921600、8-N-1。建议用 USART1：PA9 接模块 RX，PA10 接模块 TX，GND 共地。</p></div>
-        <div><b>STM32 → ST7735</b><p>Keil 工程已接入 ST7735 驱动和 ST73 串口接收端，并生成 HEX；尚未烧录实机验证。连接前请先把 HEX 写入 STM32。</p></div>
+    <aside class="card">
+      <div class="card-head">
+        <span>02 · 输出</span>
+        <em>RGB565 · 高字节在前</em>
       </div>
-      <pre id="diagnostic-log" aria-live="polite">连接后会显示协议握手、传输速度和错误信息。</pre>
-    </section>
-    <footer><span>ST73//LCD · STM32F103 + ST7735</span><span>本地媒体转换 · RGB565 · 差分分块传输</span></footer>
-  </main>
-  <script type="module" src="app.js"></script>
+
+      <label class="field">
+        <span>屏幕模组</span>
+        <select id="resolution">
+          <option value="128x160" selected>128 × 160 · 常见 1.8"</option>
+          <option value="160x128">160 × 128 · 横向模组</option>
+          <option value="128x128">128 × 128 · 方形模组</option>
+          <option value="80x160">80 × 160 · 窄屏模组</option>
+        </select>
+      </label>
+
+      <div class="field">
+        <span>显示方向</span>
+        <div class="rot" role="group" aria-label="显示方向">
+          <button type="button" data-rot="0" class="on"><i></i>竖屏</button>
+          <button type="button" data-rot="1"><i></i>横屏</button>
+          <button type="button" data-rot="2"><i class="flip"></i>竖屏倒置</button>
+          <button type="button" data-rot="3"><i class="flip"></i>横屏倒置</button>
+        </div>
+      </div>
+
+      <label class="field">
+        <span>串口波特率</span>
+        <select id="baud">
+          <option value="921600" selected>921600 · 与固件默认一致</option>
+          <option value="460800">460800</option>
+          <option value="230400">230400</option>
+          <option value="115200">115200 · 最慢但最稳</option>
+        </select>
+      </label>
+
+      <button id="send" class="primary" type="button" disabled>发送到屏幕</button>
+
+      <div class="bar"><div id="bar"></div></div>
+      <p class="status" id="status">先选一张图。</p>
+    </aside>
+  </section>
+
+  <section class="card wiring">
+    <div class="card-head">
+      <span>03 · 接线</span>
+      <em>软件 SPI，不是 I²C</em>
+    </div>
+
+    <div class="wiring-body">
+      <table class="pins">
+        <thead><tr><th>ST7735</th><th>STM32F103C8</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr class="key"><td>SCL / CLK</td><td>PB10</td><td>时钟，GPIO 模拟</td></tr>
+          <tr class="key"><td>SDA / DIO</td><td>PB11</td><td>数据，GPIO 模拟</td></tr>
+          <tr><td>DC</td><td>PB0</td><td>命令 / 数据选择</td></tr>
+          <tr><td>RES</td><td>PB1</td><td>复位</td></tr>
+          <tr><td>CS</td><td>PA7</td><td>片选</td></tr>
+          <tr><td>BL / LED</td><td>PA6</td><td>背光</td></tr>
+        </tbody>
+      </table>
+
+      <figure class="wave">
+        <svg viewBox="0 0 420 170" role="img" aria-label="DIO 在 CLK 低电平时切换，CLK 上升沿采样">
+          <text x="8" y="45" class="w-label">CLK</text>
+          <text x="8" y="105" class="w-label">DIO</text>
+
+          <line x1="60" y1="30" x2="60" y2="150" class="w-guide"/>
+          <line x1="406" y1="30" x2="406" y2="150" class="w-guide"/>
+
+          <polyline class="w-clk" points="70,60 70,35 88,35 88,60 106,60 106,35 124,35 124,60 142,60 142,35 160,35 160,60 178,60 178,35 196,35 196,60 214,60 214,35 232,35 232,60 250,60 250,35 268,35 268,60 286,60 286,35 304,35 304,60 322,60 322,35 340,35 340,60 358,60"/>
+
+          <polyline class="w-dio" points="70,100 88,100 88,120 124,120 124,100 160,100 160,120 196,120 232,120 232,100 268,100 268,120 304,120 304,100 358,100"/>
+
+          <text x="79" y="82" class="w-bit">1</text>
+          <text x="115" y="82" class="w-bit">0</text>
+          <text x="151" y="82" class="w-bit">1</text>
+          <text x="187" y="82" class="w-bit">0</text>
+          <text x="223" y="82" class="w-bit">0</text>
+          <text x="259" y="82" class="w-bit">1</text>
+          <text x="295" y="82" class="w-bit">0</text>
+          <text x="331" y="82" class="w-bit">1</text>
+
+          <text x="70" y="168" class="w-foot">一个字节 = 8 个时钟</text>
+        </svg>
+        <figcaption>DIO 在 CLK 低电平期间改电平，ST7735 在上升沿把这一位收走。8 次就是一个字节。</figcaption>
+      </figure>
+    </div>
+
+    <p class="wiring-note">
+      屏幕走 PB10/PB11 这两根线，串口另走一路：USB-TTL 的 TX 接 PA10、RX 接 PA9、GND 共地。
+      网页只往串口里倒字节，真正打时序的是 MCU。
+    </p>
+
+    <pre id="log" class="log" aria-live="polite">就绪。上电后屏幕应先出现四角彩块和白色十字——看到它，说明 DIO/CLK 已经通了。</pre>
+  </section>
+
+  <footer>
+    <span>ST73//LCD · 一张图，一根串口，两根线</span>
+    <span id="build-note">ST73-Lite v2</span>
+  </footer>
+</main>
+
+<script src="app.js"></script>
 </body>
 </html>

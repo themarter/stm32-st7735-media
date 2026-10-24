@@ -1,187 +1,305 @@
-#include "st73_receiver.h"
+/* ST73-Lite 接收器自测：不依赖 STM32 硬件，用 gcc 跑。
+ *
+ *   gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/test_receiver.c -o st73_test
+ *   ./st73_test
+ */
 
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
-static uint8_t tx[128];
-static size_t tx_len;
-static unsigned draw_count;
-static uint8_t drawn_pixel[2];
+#include "st73_receiver.h"
 
-static uint32_t crc32_test(const uint8_t *data, size_t len)
+#define BUF_MAX 8192u
+
+static uint8_t  g_pixels[BUF_MAX];
+static uint32_t g_pixel_len;
+static uint16_t g_begin_w;
+static uint16_t g_begin_h;
+static uint8_t  g_begin_ori;
+static uint8_t  g_accept = 1u;
+static int      g_begin_calls;
+static int      g_end_calls;
+static int      g_reply_calls;
+static uint8_t  g_last_status;
+static int      g_failures;
+
+static uint8_t on_begin(void *user, uint16_t w, uint16_t h, uint8_t orientation)
 {
-    uint32_t crc = 0xffffffffu;
+    (void)user;
+    ++g_begin_calls;
+    g_begin_w = w;
+    g_begin_h = h;
+    g_begin_ori = orientation;
+    return g_accept;
+}
+
+static void on_write(void *user, const uint8_t *data, uint16_t length)
+{
+    (void)user;
+    if (g_pixel_len + length <= BUF_MAX) {
+        memcpy(g_pixels + g_pixel_len, data, length);
+        g_pixel_len += length;
+    }
+    if ((length & 1u) != 0u) {
+        printf("  !! write 长度不是偶数：%u\n", (unsigned)length);
+        ++g_failures;
+    }
+}
+
+static void on_end(void *user)
+{
+    (void)user;
+    ++g_end_calls;
+}
+
+static void on_reply(void *user, uint8_t status)
+{
+    (void)user;
+    ++g_reply_calls;
+    g_last_status = status;
+}
+
+static void reset_state(void)
+{
+    g_pixel_len   = 0u;
+    g_begin_w     = 0u;
+    g_begin_h     = 0u;
+    g_begin_ori   = 0u;
+    g_accept      = 1u;
+    g_begin_calls = 0;
+    g_end_calls   = 0;
+    g_reply_calls = 0;
+    g_last_status = 0xFFu;
+}
+
+static size_t build_frame(uint8_t *out, uint16_t w, uint16_t h, uint8_t ori, uint8_t sum_delta)
+{
+    size_t  i;
+    uint8_t sum = 0u;
+    size_t  total = (size_t)ST73_HEADER_SIZE + (size_t)w * h * 2u;
+
+    out[0] = ST73_SYNC0;
+    out[1] = ST73_SYNC1;
+    out[2] = ST73_CMD_IMAGE;
+    out[3] = (uint8_t)(w & 0xFFu);
+    out[4] = (uint8_t)(w >> 8);
+    out[5] = (uint8_t)(h & 0xFFu);
+    out[6] = (uint8_t)(h >> 8);
+    out[7] = ori;
+
+    for (i = 0u; i < ST73_HEADER_SIZE - 1u; ++i) {
+        sum = (uint8_t)(sum + out[i]);
+    }
+    out[8] = (uint8_t)(sum + sum_delta);
+
+    /* 让 0xA5 0x5A 周期性地出现在像素流里，验证不会被误当成帧头 */
+    for (i = 0u; i < (size_t)w * h; ++i) {
+        uint16_t v = (uint16_t)(i * 37u);
+        if ((i % 97u) == 0u) {
+            v = 0xA55Au;
+        }
+        out[ST73_HEADER_SIZE + i * 2u]      = (uint8_t)(v >> 8);
+        out[ST73_HEADER_SIZE + i * 2u + 1u] = (uint8_t)(v & 0xFFu);
+    }
+    return total;
+}
+
+static void expect(int condition, const char *what)
+{
+    if (condition) {
+        printf("  ok   %s\n", what);
+    } else {
+        printf("  FAIL %s\n", what);
+        ++g_failures;
+    }
+}
+
+static void case_basic(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 8u * 6u * 2u];
+    size_t len;
+
+    printf("1. 整帧一次喂入（8x6）\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 8u, 6u, 1u, 0u);
+    st73_stream_feed(&stream, frame, len);
+
+    expect(g_begin_calls == 1, "begin 调用一次");
+    expect(g_begin_w == 8u && g_begin_h == 6u && g_begin_ori == 1u, "尺寸与方向正确");
+    expect(g_pixel_len == 8u * 6u * 2u, "像素字节数 = W*H*2");
+    expect(g_end_calls == 1, "end 调用一次");
+    expect(g_reply_calls == 1 && g_last_status == ST73_STATUS_OK, "回执 OK");
+    expect(st73_stream_busy(&stream) == 0u, "收完不再 busy");
+}
+
+static void case_byte_by_byte(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 16u * 4u * 2u];
+    size_t len;
     size_t i;
-    unsigned bit;
-    for (i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (bit = 0; bit < 8u; ++bit) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0u);
+
+    printf("2. 逐字节喂入（16x4，模拟串口一块一块来）\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 16u, 4u, 0u, 0u);
+    for (i = 0u; i < len; ++i) {
+        st73_stream_feed(&stream, &frame[i], 1u);
+    }
+
+    expect(g_begin_calls == 1, "begin 调用一次");
+    expect(g_pixel_len == 16u * 4u * 2u, "像素字节数正确");
+    expect(g_end_calls == 1, "end 调用一次");
+    expect(g_last_status == ST73_STATUS_OK, "回执 OK");
+    expect((size_t)g_begin_w * g_begin_h * 2u == g_pixel_len, "W*H*2 与实收一致");
+}
+
+static void case_noise(void)
+{
+    ST73_Stream stream;
+    uint8_t buf[64 + ST73_HEADER_SIZE + 4u * 4u * 2u];
+    size_t len;
+    size_t noise = 0u;
+
+    printf("3. 前置噪声里带孤立的 0xA5\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+
+    buf[noise++] = 0x00u;
+    buf[noise++] = ST73_SYNC0;      /* 假同步字，后面不是 0x5A */
+    buf[noise++] = 0x11u;
+    buf[noise++] = ST73_SYNC0;
+    buf[noise++] = ST73_SYNC0;
+    buf[noise++] = 0xFFu;
+    buf[noise++] = ST73_SYNC0;      /* 真同步字前再撒一个 0xA5 */
+    buf[noise++] = ST73_SYNC0;
+
+    len = build_frame(buf + noise, 4u, 4u, 2u, 0u);
+    st73_stream_feed(&stream, buf, noise + len);
+
+    expect(g_begin_calls == 1, "只识别出一帧");
+    expect(g_pixel_len == 4u * 4u * 2u, "像素字节数正确");
+    expect(g_begin_ori == 2u, "方向 = 2");
+    expect(g_last_status == ST73_STATUS_OK, "回执 OK");
+}
+
+static void case_bad_sum(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 4u * 4u * 2u];
+    size_t len;
+
+    printf("4. 校验和错误\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 4u, 4u, 0u, 0x5Au);
+    st73_stream_feed(&stream, frame, len);
+
+    expect(g_begin_calls == 0, "不开始帧");
+    expect(g_reply_calls == 0, "不回执");
+    expect(st73_stream_busy(&stream) == 0u, "仍在找同步字");
+}
+
+static void case_rejected_size(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 32u * 32u * 2u];
+    size_t len;
+
+    printf("5. 尺寸超出面板，驱动拒收\n");
+    reset_state();
+    g_accept = 0u;
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 32u, 32u, 0u, 0u);
+    st73_stream_feed(&stream, frame, len);
+
+    expect(g_begin_calls == 1, "begin 被调用");
+    expect(g_pixel_len == 0u, "像素被丢弃，没有画");
+    expect(g_end_calls == 0, "不调 end");
+    expect(g_last_status == ST73_STATUS_BAD_SIZE, "回执 BAD_SIZE");
+    expect(st73_stream_busy(&stream) == 0u, "整帧吞完，回到空闲");
+}
+
+static void case_two_frames(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 4u * 4u * 2u];
+    size_t len;
+
+    printf("6. 连续两帧\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 4u, 4u, 0u, 0u);
+    st73_stream_feed(&stream, frame, len);
+    st73_stream_feed(&stream, frame, len);
+
+    expect(g_begin_calls == 2, "begin 两次");
+    expect(g_end_calls == 2, "end 两次");
+    expect(g_pixel_len == 2u * 4u * 4u * 2u, "像素累计正确");
+    expect(g_reply_calls == 2, "回执两次");
+}
+
+static void case_abandon_frame(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 16u * 16u * 2u];
+    size_t len;
+
+    printf("7. 半帧后 reset，再收新帧\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 16u, 16u, 0u, 0u);
+    st73_stream_feed(&stream, frame, len / 2u);
+    expect(st73_stream_busy(&stream) == 1u, "半帧时 busy");
+
+    st73_stream_reset(&stream);
+    expect(st73_stream_busy(&stream) == 0u, "reset 后空闲");
+
+    g_pixel_len   = 0u;
+    g_begin_calls = 0;
+    len = build_frame(frame, 4u, 4u, 0u, 0u);
+    st73_stream_feed(&stream, frame, len);
+    expect(g_begin_calls == 1, "新帧被识别");
+    expect(g_pixel_len == 4u * 4u * 2u, "新帧像素完整");
+}
+
+static void case_pixel_content(void)
+{
+    ST73_Stream stream;
+    uint8_t frame[ST73_HEADER_SIZE + 8u * 8u * 2u];
+    size_t len;
+    size_t i;
+    int mismatch = 0;
+
+    printf("8. 像素内容逐字节一致\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    len = build_frame(frame, 8u, 8u, 0u, 0u);
+    st73_stream_feed(&stream, frame, len);
+
+    for (i = 0u; i < (size_t)8u * 8u * 2u; ++i) {
+        if (g_pixels[i] != frame[ST73_HEADER_SIZE + i]) {
+            ++mismatch;
         }
     }
-    return crc ^ 0xffffffffu;
-}
-
-static size_t cobs_encode_test(const uint8_t *src, size_t len, uint8_t *dst)
-{
-    size_t in = 0u, out = 1u, code_pos = 0u;
-    uint8_t code = 1u;
-    while (in < len) {
-        if (src[in] == 0u) {
-            dst[code_pos] = code;
-            code = 1u;
-            code_pos = out++;
-            ++in;
-        } else {
-            dst[out++] = src[in++];
-            ++code;
-            if (code == 0xffu) {
-                dst[code_pos] = code;
-                code = 1u;
-                code_pos = out++;
-            }
-        }
-    }
-    dst[code_pos] = code;
-    return out;
-}
-
-static size_t cobs_decode_test(const uint8_t *src, size_t len, uint8_t *dst)
-{
-    size_t in = 0u, out = 0u;
-    while (in < len) {
-        uint8_t code = src[in++];
-        size_t i;
-        assert(code != 0u);
-        for (i = 1u; i < code; ++i) {
-            assert(in < len);
-            dst[out++] = src[in++];
-        }
-        if (code != 0xffu && in < len) {
-            dst[out++] = 0u;
-        }
-    }
-    return out;
-}
-
-static void uart_write(void *user, const uint8_t *data, size_t len)
-{
-    (void)user;
-    assert(len <= sizeof(tx));
-    memcpy(tx, data, len);
-    tx_len = len;
-}
-
-static void draw_tile(void *user, uint16_t x, uint16_t y,
-                      uint16_t w, uint16_t h, const uint8_t *pixels)
-{
-    (void)user;
-    assert(x == 0u && y == 0u && w == 1u && h == 1u);
-    drawn_pixel[0] = pixels[0];
-    drawn_pixel[1] = pixels[1];
-    ++draw_count;
-}
-
-static size_t build_request(uint8_t channel, uint16_t seq,
-                            const uint8_t *payload, size_t payload_len,
-                            uint8_t *wire)
-{
-    uint8_t raw[128];
-    size_t raw_len = 3u + payload_len + 4u;
-    uint32_t crc;
-    size_t enc_len;
-
-    raw[0] = channel;
-    raw[1] = (uint8_t)(seq & 0xffu);
-    raw[2] = (uint8_t)(seq >> 8);
-    memcpy(raw + 3, payload, payload_len);
-    crc = crc32_test(raw, 3u + payload_len);
-    raw[3u + payload_len] = (uint8_t)crc;
-    raw[4u + payload_len] = (uint8_t)(crc >> 8);
-    raw[5u + payload_len] = (uint8_t)(crc >> 16);
-    raw[6u + payload_len] = (uint8_t)(crc >> 24);
-    wire[0] = 0u;
-    enc_len = cobs_encode_test(raw, raw_len, wire + 1u);
-    wire[enc_len + 1u] = 0u;
-    return enc_len + 2u;
-}
-
-static const uint8_t *request_and_get_response(
-    ST73_Receiver *receiver, uint8_t channel, uint16_t seq,
-    const uint8_t *payload, size_t payload_len,
-    uint8_t *response_payload, size_t *response_payload_len)
-{
-    uint8_t wire[160];
-    uint8_t raw[128];
-    size_t wire_len = build_request(channel, seq, payload, payload_len, wire);
-    size_t raw_len;
-    uint32_t expected_crc;
-
-    tx_len = 0u;
-    /* Split the request to exercise incremental UART feeding. */
-    st73_receiver_feed(receiver, wire, wire_len / 2u);
-    st73_receiver_feed(receiver, wire + wire_len / 2u, wire_len - wire_len / 2u);
-
-    assert(tx_len >= 9u);
-    assert(tx[0] == 0u && tx[tx_len - 1u] == 0u);
-    raw_len = cobs_decode_test(tx + 1u, tx_len - 2u, raw);
-    assert(raw_len >= 7u);
-    expected_crc = (uint32_t)raw[raw_len - 4u]
-                 | ((uint32_t)raw[raw_len - 3u] << 8)
-                 | ((uint32_t)raw[raw_len - 2u] << 16)
-                 | ((uint32_t)raw[raw_len - 1u] << 24);
-    assert(raw[0] == 2u);
-    assert(raw[1] == (uint8_t)(seq & 0xffu));
-    assert(raw[2] == (uint8_t)(seq >> 8));
-    assert(crc32_test(raw, raw_len - 4u) == expected_crc);
-    *response_payload_len = raw_len - 7u;
-    memcpy(response_payload, raw + 3u, *response_payload_len);
-    return response_payload;
-}
-
-static void assert_ack(ST73_Receiver *receiver, uint8_t channel,
-                       uint16_t seq, const uint8_t *payload, size_t len)
-{
-    uint8_t reply[32];
-    size_t reply_len = 0u;
-    (void)request_and_get_response(receiver, channel, seq, payload, len,
-                                   reply, &reply_len);
-    assert(reply_len == 2u);
-    assert(reply[0] == 0x80u && reply[1] == 0u);
+    expect(mismatch == 0, "64 个像素无一字节错位");
 }
 
 int main(void)
 {
-    ST73_Receiver receiver;
-    uint8_t reply[32];
-    size_t reply_len = 0u;
-    const uint8_t hello[] = { 0x01u };
-    uint8_t begin[12] = {
-        0x10u, 0x34u, 0x12u, 128u, 0u, 160u, 0u, 0u,
-        100u, 0u, 1u, 0u
-    };
-    uint8_t tile_data[13] = {
-        0x34u, 0x12u, 0u, 0u, /* frame ID, chunk index */
-        0u, 0u, 1u, 1u, 0u, 2u, 0u, /* one raw 1x1 tile */
-        0xf8u, 0x00u /* RGB565 red, big-endian */
-    };
-    const uint8_t end[] = { 0x11u, 0x34u, 0x12u };
+    printf("ST73-Lite receiver test\n\n");
 
-    st73_receiver_init(&receiver, 128u, 160u, draw_tile, NULL, uart_write, NULL);
+    case_basic();
+    case_byte_by_byte();
+    case_noise();
+    case_bad_sum();
+    case_rejected_size();
+    case_two_frames();
+    case_abandon_frame();
+    case_pixel_content();
 
-    (void)request_and_get_response(&receiver, 0u, 7u, hello, sizeof(hello),
-                                   reply, &reply_len);
-    assert(reply_len == 6u);
-    assert(reply[0] == 0x81u && reply[1] == 128u && reply[2] == 0u);
-    assert(reply[3] == 160u && reply[4] == 0u && reply[5] == 1u);
-
-    assert_ack(&receiver, 0u, 8u, begin, sizeof(begin));
-    assert_ack(&receiver, 1u, 9u, tile_data, sizeof(tile_data));
-    assert(draw_count == 1u && drawn_pixel[0] == 0xf8u && drawn_pixel[1] == 0x00u);
-    assert_ack(&receiver, 0u, 10u, end, sizeof(end));
-    assert(receiver.frame_active == 0u);
-
-    puts("ST73 receiver tests: PASS (COBS/CRC, HELLO, fragmented UART, RGB565 tile, ACK, frame-end)");
-    return 0;
+    printf("\n%s（%d 个失败）\n", g_failures == 0 ? "全部通过" : "有失败用例", g_failures);
+    return g_failures == 0 ? 0 : 1;
 }

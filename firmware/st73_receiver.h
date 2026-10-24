@@ -1,6 +1,13 @@
 #ifndef ST73_RECEIVER_H
 #define ST73_RECEIVER_H
 
+/* ST73-Lite v2 —— 极简单图流式接收器。
+ *
+ * 线上只有一种东西：9 字节帧头 + W*H*2 字节 RGB565。
+ * 接收器不做整帧缓冲，像素字节攒够一批就直接交给 write 回调，
+ * 由驱动按 DIO/CLK 时序推给 ST7735。
+ */
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -8,57 +15,63 @@
 extern "C" {
 #endif
 
-#define ST73_PROTOCOL_VERSION 1u
-#define ST73_MAX_TILE_SIZE 16u
-#define ST73_MAX_TILE_BYTES (ST73_MAX_TILE_SIZE * ST73_MAX_TILE_SIZE * 2u)
-#define ST73_MAX_ENCODED_PACKET 1900u
+#define ST73_SYNC0           0xA5u
+#define ST73_SYNC1           0x5Au
+#define ST73_CMD_IMAGE       0x01u
+#define ST73_HEADER_SIZE     9u
 
-typedef void (*st73_draw_tile_fn)(
-    void *user,
-    uint16_t x, uint16_t y,
-    uint16_t width, uint16_t height,
-    const uint8_t *rgb565_be);
+/* 回执状态 */
+#define ST73_STATUS_OK       0x00u
+#define ST73_STATUS_BAD_SIZE 0x01u
+#define ST73_STATUS_ABORTED  0x02u
 
-typedef void (*st73_set_orientation_fn)(void *user, uint8_t orientation);
-typedef void (*st73_uart_write_fn)(void *user, const uint8_t *data, size_t len);
+/* 开始一帧：驱动在这里设方向、设窗口，并保持 CS 低、DC 高。
+ * 返回 1 表示接受这一帧；返回 0 表示尺寸不合法，随后的像素会被丢弃。 */
+typedef uint8_t (*st73_begin_fn)(void *user, uint16_t width, uint16_t height, uint8_t orientation);
+/* 连续像素数据，length 一定是偶数，高字节在前。 */
+typedef void (*st73_write_fn)(void *user, const uint8_t *rgb565_be, uint16_t length);
+/* 结束一帧：拉高 CS。 */
+typedef void (*st73_end_fn)(void *user);
+/* 回 3 字节状态：0x5A 0xA5 status。允许传 NULL。 */
+typedef void (*st73_reply_fn)(void *user, uint8_t status);
 
 typedef struct {
-    /* Scratch buffers live in receiver state to keep embedded stack use small. */
-    uint8_t rx_encoded[ST73_MAX_ENCODED_PACKET];
-    uint8_t tile_pixels[ST73_MAX_TILE_BYTES];
-    size_t rx_len;
+    uint8_t  header[ST73_HEADER_SIZE];
+    uint8_t  header_len;
 
-    uint16_t panel_width;
-    uint16_t panel_height;
+    uint8_t  active;        /* 1 = 正在收像素 */
+    uint8_t  discard;       /* 1 = 帧头不接受，像素只丢不画 */
+    uint8_t  half_valid;    /* 1 = 存着上一批末尾落单的那个字节 */
+    uint8_t  half_byte;
 
-    uint8_t frame_active;
-    uint8_t orientation;
-    uint16_t frame_id;
-    uint16_t frame_width;
-    uint16_t frame_height;
-    uint16_t frame_delay_ms;
-    uint16_t expected_tiles;
-    uint16_t received_tiles;
-    uint16_t expected_chunk;
+    uint16_t width;
+    uint16_t height;
+    uint8_t  orientation;
+    uint32_t remaining;     /* 还差多少像素字节 */
 
-    st73_draw_tile_fn draw_tile;
-    st73_set_orientation_fn set_orientation;
-    st73_uart_write_fn uart_write;
+    st73_begin_fn begin;
+    st73_write_fn write;
+    st73_end_fn   end;
+    st73_reply_fn reply;
     void *user;
-} ST73_Receiver;
+} ST73_Stream;
 
-/* panel_width/height are the native logical dimensions at orientation 0. */
-void st73_receiver_init(
-    ST73_Receiver *receiver,
-    uint16_t panel_width,
-    uint16_t panel_height,
-    st73_draw_tile_fn draw_tile,
-    st73_set_orientation_fn set_orientation,
-    st73_uart_write_fn uart_write,
+void st73_stream_init(
+    ST73_Stream *stream,
+    st73_begin_fn begin,
+    st73_write_fn write,
+    st73_end_fn end,
+    st73_reply_fn reply,
     void *user);
 
-/* Feed arbitrary UART byte fragments; zero-byte COBS delimiters are parsed internally. */
-void st73_receiver_feed(ST73_Receiver *receiver, const uint8_t *data, size_t len);
+/* 喂任意分片的串口字节；内部自行找同步字。 */
+void st73_stream_feed(ST73_Stream *stream, const uint8_t *data, size_t length);
+
+/* 上电或异常时清状态，避免半帧残留。 */
+void st73_stream_reset(ST73_Stream *stream);
+
+/* 是否正在接收一帧，可以用来点 LED。 */
+uint8_t st73_stream_busy(const ST73_Stream *stream);
 
 #ifdef __cplusplus
 }

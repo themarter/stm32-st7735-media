@@ -1,76 +1,108 @@
-# ST73 // LCD — STM32F103 + ST7735
+# ST73 // LCD
 
-浏览器端图片、GIF、视频转 RGB565，并通过 USB-TTL 串口发送给 **STM32F103C8 + ST7735**。网页只负责媒体处理和串口传输，不直接控制 LCD 引脚。
+把一张图片送进 **STM32F103C8 + ST7735** 的彩屏。
 
-## 在线体验
+只有这一件事。不做 GIF，不做视频，不做实时动画。
 
-<https://themarter.github.io/stm32-st7735-media/>
+在线：<https://themarter.github.io/stm32-st7735-media/>
 
-## 当前功能
+---
 
-- 本地转换 PNG、JPEG、WebP、GIF 与短视频为 RGB565。
-- 支持 128×160、160×128、128×128、160×80 画幅和四种方向。
-- 16×16 tile 差分、RLE 压缩、离线导出 `.st73` 媒体包。
-- Web Serial 实时传输，默认 921600 baud、8-N-1。
-- C 接收协议：COBS、CRC-32、握手/ACK、RGB565 tile 解码；不缓存 40 KiB 的整屏帧缓冲，适配 STM32F103C8 的 20 KiB SRAM。
+## 它怎么工作
 
-## 你的实际接线
+```
+图片 ──▶ 浏览器转 RGB565 ──▶ 串口(USB-TTL) ──▶ STM32 ──▶ DIO/CLK ──▶ ST7735
+        (canvas, 本地完成)      921600 8-N-1     收字节    软件 SPI     亮屏
+```
 
-LCD 与 USB-TTL 是两组不同的线路。
+网页不碰引脚，它只把像素倒进串口。真正打时序的是 MCU：`PB10` 出时钟、`PB11` 出数据，一个字节 8 个时钟推上去。
 
-| ST7735 | STM32F103C8 |
-| --- | --- |
-| SCL / CLK | PB10 |
-| SDA / DIO | PB11 |
-| DC | PB0 |
-| RES | PB1 |
-| CS | PA7 |
-| BL / LED | PA6 |
+## 接线
 
-屏幕驱动使用 PB10/PB11 GPIO 模拟 SPI 时序；**不是 I²C，也不是 ESP32**。
+屏幕和串口是两组线，别混。
 
-USB-TTL（3.3 V 逻辑电平、必须共地）：
+| ST7735 | STM32F103C8 | 作用 |
+| --- | --- | --- |
+| SCL / CLK | **PB10** | 时钟，GPIO 模拟 |
+| SDA / DIO | **PB11** | 数据，GPIO 模拟 |
+| DC | PB0 | 命令 / 数据 |
+| RES | PB1 | 复位 |
+| CS | PA7 | 片选 |
+| BL / LED | PA6 | 背光 |
 
 | USB-TTL | STM32F103C8 |
 | --- | --- |
-| TX | PA10 / USART1_RX |
-| RX | PA9 / USART1_TX |
-| GND | GND |
+| TX | PA10（USART1_RX） |
+| RX | PA9（USART1_TX） |
+| GND | GND（必须共地） |
 
-串口设置为 921600、8-N-1。网页的串口只传图像数据，STM32 再通过 PB10/PB11 驱动 ST7735。
+屏幕侧是 **SPI，不是 I²C**，尽管丝印写着 SCL/SDA。串口 921600、8-N-1。
 
-## Keil 工程集成
+## 网页怎么用
 
-本次已把以下代码加入本地 Keil 工程 `C:\Users\11695\Desktop\stm32project\模块`：
+1. 拖一张图进去 → 自动裁成屏幕画幅、转 RGB565。
+2. 选模组尺寸和方向。
+3. 点「连接串口」，选你的 CH340 → 点「发送到屏幕」。
 
-- `my_lib/st7735.c`、`my_lib/st7735.h`：ST7735 初始化、RGB565 矩形/像素绘制、方向切换。
-- `my_lib/st73_receiver.c`、`my_lib/st73_receiver.h`：串口投屏协议接收、分块解码和 ACK。
-- `user/main.c`：USART1 921600 RX 中断 + 4096 字节环形队列；中断只收字节，主循环解析协议并绘制，避免在中断里阻塞刷屏。
+大约 0.5 秒一帧。发完会等 MCU 回 3 字节确认；收不到只是提示，不影响发送。
 
-没有收到网页串口数据时，主程序运行彩色方块移动测试；收到串口数据后，移动测试停止，让媒体画面控制屏幕。断开投屏后会保留最后一帧。
+需要 Chrome 或 Edge，且页面跑在 HTTPS 或 localhost 下。
 
-## 构建与验证状态
+## 固件怎么用
 
-当前已用 ARMCC 5.06 编译主程序、ST7735 驱动和接收器，并成功链接生成：
+`firmware/` 里是完整的四个文件：
 
-- `Objects/template.axf`
-- `Objects/template.hex`
+| 文件 | 作用 |
+| --- | --- |
+| `st7735.c/.h` | ST7735 驱动，软件 SPI，流式写屏 |
+| `st73_receiver.c/.h` | 串口字节 → 帧头解析 → 像素流，不缓存整帧 |
+| `main_example.c` | USART1 + 环形队列 + 主循环，可直接替换工程里的 `main.c` |
+| `test_receiver.c` | 主机侧自测，不需要板子 |
 
-这是软件构建验证，不等于实机显示验证。当前电脑检测到 USB-SERIAL CH340K（COM6），没有检测到 ST-LINK；因此尚未把 HEX 烧录到芯片，也未声称屏幕已经显示成功。原始主程序和工程文件保存在 `backup_pre_st7735_20261024`，动画测试版保存在 `backup_pre_stream_20261024`。
+Keil 工程里放法：驱动和接收器进 `my_lib/`，`main_example.c` 当作 `user/main.c`。文件名保持 `st73_receiver.c` / `st7735.c`，工程的 `.uvprojx` 不用动。
 
-## 本地运行网页
+改波特率就改 `main_example.c` 顶部的 `LINK_BAUD`，网页那边也要选一样的。
 
-在仓库根目录执行：
+## 出问题按这个顺序查
 
-    py -m http.server 8000
+**第一步：上电有没有图案**
 
-然后用最新版 Chrome/Edge 打开 <http://localhost:8000>。Web Serial 需要 HTTPS 或 localhost，点击“连接 STM32”后由你选择串口。
+上电后屏幕应该出现：四角四个彩色方块（红、绿、蓝、黄）+ 中间白色十字。
 
-## 协议自测
+- 有 → DIO/CLK/DC/RES/CS 接线和初始化都是对的，问题在后面。
+- 没有 → 先别管串口。查背光(BL)、共地、RES，或者模组是不是 128×160 之外的其他尺寸（那样初始化参数要改）。
 
-电脑装有 GCC 时，在仓库根目录运行：
+**第二步：串口通不通**
 
-    gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/test_receiver.c -o st73_test.exe
-    .\st73_test.exe
+网页能连上串口，但发送后屏幕没反应：
 
-主机协议测试通过不代表已在实体屏幕上验证。显示效果还会受到 ST7735 模组版本、可视区域偏移和屏幕方向设置影响。
+- 看网页日志里有没有「设备回执 OK」。有回执说明双向都通。
+- 没回执但字节都发出去了 → 大概率是 STM32 的 TX（PA9）没接到 USB-TTL 的 RX。回执是单向诊断，不接也能显示。
+- 检查波特率和固件里的 `LINK_BAUD` 是否一致。
+
+**第三步：图像对不对**
+
+- 颜色是反的 → 模组是 RGB 屏不是 BGR，改 `st7735.c` 里 `madctl[]` 的 `0x08` 位。
+- 画面偏移几个像素 → 模组有 offset，需要在 `LCD_SetWindow` 里加偏移量。
+- 方向不对 → 网页切方向就行，不用重烧。
+
+## 协议
+
+见 [`firmware/PROTOCOL.md`](firmware/PROTOCOL.md)。一句话：`A5 5A 01 W_LO W_HI H_LO H_HI ORI SUM` + `W*H*2` 字节 RGB565（高字节在前）。
+
+## 自测
+
+装了 gcc 就跑：
+
+```
+gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/test_receiver.c -o st73_test
+./st73_test
+```
+
+32 项断言，覆盖整帧/逐字节/噪声同步/坏校验/尺寸拒收/连发两帧/半帧复位/像素逐字节一致。主机测试通过不等于屏幕能亮，显示还取决于模组版本和接线。
+
+## 和上一版的关系
+
+上一版想做 GIF 和视频实时投屏，于是堆了 COBS、CRC32、16×16 tile 差分、RLE、双向 ACK、帧序列号——功能没验证通，复杂度先起来了。
+
+这一版全部删掉，回到「发一张图、点亮一块屏」。等这张图稳定显示了，再谈动画。
