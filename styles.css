@@ -121,6 +121,15 @@ main {
   animation: pulse 1s infinite;
 }
 
+.link[data-state="warn"] .link-dot {
+  background: var(--red);
+  box-shadow: 0 0 0 4px rgba(242, 112, 95, .16);
+}
+
+.link[data-state="warn"] .link-label {
+  color: var(--red);
+}
+
 @keyframes pulse {
   50% { opacity: .35; }
 }

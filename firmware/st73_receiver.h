@@ -18,12 +18,20 @@ extern "C" {
 #define ST73_SYNC0           0xA5u
 #define ST73_SYNC1           0x5Au
 #define ST73_CMD_IMAGE       0x01u
+#define ST73_CMD_PING        0x00u   /* 4 字节：A5 5A 00 55，用来探链路 */
+#define ST73_PING_MAGIC      0x55u   /* PING 的第 4 个字节，防止 3 字节巧合 */
 #define ST73_HEADER_SIZE     9u
 
 /* 回执状态 */
 #define ST73_STATUS_OK       0x00u
 #define ST73_STATUS_BAD_SIZE 0x01u
 #define ST73_STATUS_ABORTED  0x02u
+#define ST73_STATUS_INFO     0x80u   /* 回 4 字节：5A A5 80 版本 */
+
+/* 固件版本。改了线上格式就 +1，网页据此判断烧的是不是新固件：
+ *   v2 = 只有图像帧（A5 5A 01 ...）
+ *   v3 = 加了 PING 握手（A5 5A 00） */
+#define ST73_FW_VERSION      3u
 
 /* 开始一帧：驱动在这里设方向、设窗口，并保持 CS 低、DC 高。
  * 返回 1 表示接受这一帧；返回 0 表示尺寸不合法，随后的像素会被丢弃。 */

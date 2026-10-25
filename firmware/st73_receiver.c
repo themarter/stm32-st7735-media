@@ -114,6 +114,23 @@ static size_t consume_header(ST73_Stream *s, const uint8_t *p, size_t n)
         } else {
             s->header[s->header_len] = b;
             ++s->header_len;
+
+            /* PING 只有 4 个字节，不能让它等满 9 个 —— 否则后面紧跟的图像帧
+             * 会被当成 PING 的参数，白白吞掉 5 个字节。
+             *
+             * 为什么是 4 字节而不是 3 字节：像素流里 A5 5A 后面跟个 0x00
+             * 太常见了（RGB565 的高字节经常是 0），3 字节会把噪声当命令。
+             * 第 4 个字节固定 0x55，要求 4 字节精确匹配。 */
+            if (s->header_len == 4u &&
+                s->header[2] == ST73_CMD_PING &&
+                s->header[3] == ST73_PING_MAGIC) {
+                s->header_len = 0u;
+                if (s->reply != 0) {
+                    s->reply(s->user, ST73_STATUS_INFO);
+                }
+                continue;
+            }
+
             if (s->header_len == ST73_HEADER_SIZE) {
                 begin_frame(s);
                 return i;

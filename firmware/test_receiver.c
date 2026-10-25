@@ -287,6 +287,51 @@ static void case_pixel_content(void)
     expect(mismatch == 0, "64 个像素无一字节错位");
 }
 
+static void case_ping(void)
+{
+    ST73_Stream stream;
+    uint8_t ping[4] = { ST73_SYNC0, ST73_SYNC1, ST73_CMD_PING, ST73_PING_MAGIC };
+    uint8_t frame[ST73_HEADER_SIZE + 8u * 8u * 2u];
+    size_t  len;
+    size_t  i;
+
+    printf("9. PING 握手\n");
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    st73_stream_feed(&stream, ping, 4u);
+
+    expect(g_begin_calls == 0, "不开始帧");
+    expect(g_reply_calls == 1, "回一次");
+    expect(g_last_status == ST73_STATUS_INFO, "回执是设备信息");
+    expect(st73_stream_busy(&stream) == 0u, "握手后仍在找同步字");
+
+    /* 握完手紧接着发图，不能因为 PING 而错位 */
+    len = build_frame(frame, 8u, 8u, 0u, 0u);
+    st73_stream_feed(&stream, ping, 4u);
+    st73_stream_feed(&stream, frame, len);
+
+    expect(g_reply_calls == 3, "PING + 图像各回一次");
+    expect(g_begin_calls == 1, "图像正常开始");
+    expect(g_pixel_len == 8u * 8u * 2u, "像素长度正确");
+
+    for (i = 0u; i < (size_t)8u * 8u * 2u; ++i) {
+        if (g_pixels[i] != frame[ST73_HEADER_SIZE + i]) {
+            break;
+        }
+    }
+    expect(i == (size_t)8u * 8u * 2u, "PING 没有吞掉图像的头");
+
+    /* 3 字节的 A5 5A 00 不算 PING，像素里这种情况很常见 */
+    reset_state();
+    st73_stream_init(&stream, on_begin, on_write, on_end, on_reply, 0);
+    {
+        uint8_t not_ping[4] = { ST73_SYNC0, ST73_SYNC1, ST73_CMD_PING, 0x25u };
+        st73_stream_feed(&stream, not_ping, 4u);
+    }
+    expect(g_reply_calls == 0, "A5 5A 00 25 不当成 PING");
+    expect(g_begin_calls == 0, "也不当成图像");
+}
+
 int main(void)
 {
     printf("ST73-Lite receiver test\n\n");
@@ -299,6 +344,7 @@ int main(void)
     case_two_frames();
     case_abandon_frame();
     case_pixel_content();
+    case_ping();
 
     printf("\n%s（%d 个失败）\n", g_failures == 0 ? "全部通过" : "有失败用例", g_failures);
     return g_failures == 0 ? 0 : 1;

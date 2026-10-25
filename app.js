@@ -18,6 +18,12 @@ const HEADER_SIZE = 9;
 const WRITE_CHUNK = 8192;
 const SYNC = [0xA5, 0x5A];
 
+/* 握手：4 个字节探一下链路和固件版本。第 4 个字节是魔数，
+ * 因为像素流里 A5 5A 后面跟 0x00 太常见，3 字节会被噪声误触发。 */
+const CMD_PING = [0xA5, 0x5A, 0x00, 0x55];
+const REPLY_INFO = 0x80;
+const FW_VERSION = 3;
+
 const state = {
   image: null,
   width: 128,
@@ -27,9 +33,11 @@ const state = {
   port: null,
   writer: null,
   reader: null,
-  baud: 921600,
+  baud: 115200,
+  fwVersion: null,
   sending: false,
-  ackResolve: null
+  ackResolve: null,
+  infoResolve: null
 };
 
 /* ---------- 小工具 ---------- */
@@ -214,22 +222,102 @@ async function readLoop() {
 
       for (let i = 0; i < value.length; i++) {
         tail.push(value[i]);
-        if (tail.length > 3) { tail.shift(); }
-        if (tail.length === 3 && tail[0] === 0x5A && tail[1] === 0xA5) {
-          const status = tail[2];
-          tail.length = 0;
-          if (state.ackResolve) {
-            const resolve = state.ackResolve;
-            state.ackResolve = null;
-            resolve(status);
+
+        /* 窗口左端对不齐 5A A5 就一直往右滑，直到对上 */
+        while (tail.length >= 2 && !(tail[0] === 0x5A && tail[1] === 0xA5)) {
+          tail.shift();
+        }
+
+        if (tail.length >= 3) {
+          const code = tail[2];
+
+          if (code === REPLY_INFO) {
+            /* 设备信息回执是 4 字节：5A A5 80 版本 */
+            if (tail.length >= 4) {
+              const version = tail[3];
+              tail.length = 0;
+              if (state.infoResolve) {
+                const resolve = state.infoResolve;
+                state.infoResolve = null;
+                resolve(version);
+              } else {
+                log('设备信息：固件 v' + version);
+              }
+            }
           } else {
-            log('设备主动回执：status=' + status);
+            tail.length = 0;
+            if (state.ackResolve) {
+              const resolve = state.ackResolve;
+              state.ackResolve = null;
+              resolve(code);
+            } else {
+              log('设备主动回执：status=' + code);
+            }
           }
         }
+
+        if (tail.length > 8) { tail.shift(); }
       }
     }
   } catch (err) {
     if (state.port) { log('串口读取中断：' + err.message); }
+  }
+}
+
+function waitInfo(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      state.infoResolve = null;
+      resolve(null);
+    }, ms);
+    state.infoResolve = (version) => {
+      clearTimeout(timer);
+      state.infoResolve = null;
+      resolve(version);
+    };
+  });
+}
+
+/* 探一下对面到底在不在、固件是哪一版。
+ * 这一步能把「传图没反应」立刻分成三类：链路不通 / 固件太旧 / 固件正常。 */
+async function pingDevice() {
+  if (!state.writer) { return null; }
+
+  const waiting = waitInfo(1200);
+  try {
+    await state.writer.write(new Uint8Array(CMD_PING));
+  } catch (err) {
+    log('握手发不出去：' + err.message);
+    return null;
+  }
+  return waiting;
+}
+
+async function handshake() {
+  const version = await pingDevice();
+
+  if (version === null) {
+    state.fwVersion = null;
+    setLink('warn', '串口开了，但设备没回应', state.baud + ' · 先看下面四条');
+    log('握手没回应。按顺序查：');
+    log('  1. 波特率 —— 换成 115200 再点一次「断开 / 连接」，别停在 921600 上死磕');
+    log('  2. 交叉接线 —— USB-TTL 的 TX 接 PA10、RX 接 PA9，GND 必须共地');
+    log('  3. 固件版本 —— 今天这版屏底部会画 3 个小白点；只有彩块和十字说明烧的是旧的');
+    log('  4. 串口被占用 —— 关掉其他串口助手，一个口只能被一个程序打开');
+    setStatus('串口开着，但设备没有回应握手。先按日志里四条查。', 'err');
+    return;
+  }
+
+  state.fwVersion = version;
+  if (version === FW_VERSION) {
+    setLink('on', '设备在线 · 固件 v' + version, state.baud + ' · 8-N-1');
+    log('握手成功：固件 v' + version + '，链路通。');
+    setStatus(state.pixels ? '可以发送了。' : '先选一张图。');
+  } else {
+    setLink('warn', '设备在线 · 固件 v' + version, '网页按 v' + FW_VERSION + ' 发的');
+    log('握手成功，但固件是 v' + version + '，网页按 v' + FW_VERSION + ' 发。');
+    log('协议可能对不上，建议把 firmware/ 里的文件重新烧一遍。');
+    setStatus('固件版本比网页旧，传图可能没反应。', 'err');
   }
 }
 
@@ -268,9 +356,12 @@ async function toggleConnect() {
     readLoop();
 
     ui.connect.textContent = '断开';
-    setLink('on', '串口已连接', baud + ' · 8-N-1');
-    log('串口打开：' + baud + ' 8-N-1。');
-    setStatus(state.pixels ? '可以发送了。' : '先选一张图。');
+    setLink('busy', '串口已连接', baud + ' · 8-N-1');
+    log('串口打开：' + baud + ' 8-N-1，先握手探一下。');
+    refreshSend();
+
+    /* 连上就探一次，别等用户把图发完才发现链路根本没通 */
+    await handshake();
     refreshSend();
   } catch (err) {
     if (err && err.name === 'NotFoundError') {
@@ -294,6 +385,8 @@ async function disconnect() {
   state.writer = null;
   state.reader = null;
   state.ackResolve = null;
+  state.infoResolve = null;
+  state.fwVersion = null;
 
   ui.connect.textContent = '连接串口';
   setLink('idle', '串口未连接', '需要 Chrome 或 Edge');
@@ -383,7 +476,10 @@ async function send() {
     state.sending = false;
     ui.send.textContent = '发送到屏幕';
     refreshSend();
-    if (state.port) { setLink('on', '串口已连接', state.baud + ' · 8-N-1'); }
+    if (state.port) {
+      const label = state.fwVersion ? '设备在线 · 固件 v' + state.fwVersion : '串口已连接';
+      setLink(state.fwVersion ? 'on' : 'warn', label, state.baud + ' · 8-N-1');
+    }
   }
 }
 

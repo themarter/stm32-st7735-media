@@ -88,10 +88,10 @@
       <label class="field">
         <span>串口波特率</span>
         <select id="baud">
-          <option value="921600" selected>921600 · 与固件默认一致</option>
-          <option value="460800">460800</option>
+          <option value="115200" selected>115200 · 先用这个确认链路通</option>
           <option value="230400">230400</option>
-          <option value="115200">115200 · 最慢但最稳</option>
+          <option value="460800">460800</option>
+          <option value="921600">921600 · 时钟不准就一个字节都收不到</option>
         </select>
       </label>
 
@@ -158,7 +158,7 @@
 
   <footer>
     <span>ST73//LCD · 一张图，一根串口，两根线</span>
-    <span id="build-note">ST73-Lite v2</span>
+    <span id="build-note">ST73-Lite v3</span>
   </footer>
 </main>
 
