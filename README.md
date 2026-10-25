@@ -58,10 +58,23 @@
 | `st73_receiver.c/.h` | 串口字节 → 帧头解析 → 像素流，不缓存整帧 |
 | `main_example.c` | USART1 + 环形队列 + 主循环，可直接替换工程里的 `main.c` |
 | `test_receiver.c` | 主机侧自测，不需要板子 |
+| `test_cross.c` | 拿网页真实产出的帧做交叉验证，不需要板子 |
 
 Keil 工程里放法：驱动和接收器进 `my_lib/`，`main_example.c` 当作 `user/main.c`。文件名保持 `st73_receiver.c` / `st7735.c`，工程的 `.uvprojx` 不用动。
 
 改波特率就改 `main_example.c` 顶部的 `LINK_BAUD`，网页那边也要选一样的。
+
+## 烧进板子
+
+工程是 `template.uvprojx`（Device = STM32F103C8，编译器 ARMCC V5.06）。
+
+1. F7 编译，产物在 `Objects/template.hex`。
+2. 下载，两条路任选：
+   - **ST-Link（推荐）**：VCC / GND / SWDIO=PA13 / SWCLK=PA14 四根线，Keil 里 Debug 选 ST-Link，按 Load。
+   - **串口 ISP**：BOOT0 拉高、BOOT1 接地，复位后用 STM32CubeProgrammer 走 USART1 下 hex，下完 BOOT0 拉回低再复位。
+3. 烧完先把串口拔了，只上电看屏幕：四角彩块 + 白十字。这一步过了，才说明驱动和接线没问题。
+
+注意 PA9 既是 USART1 的 TX，也是串口 ISP 的下载线，别把下载器和 USB-TTL 同时接上去。
 
 ## 出问题按这个顺序查
 
@@ -100,6 +113,21 @@ gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/t
 ```
 
 32 项断言，覆盖整帧/逐字节/噪声同步/坏校验/尺寸拒收/连发两帧/半帧复位/像素逐字节一致。主机测试通过不等于屏幕能亮，显示还取决于模组版本和接线。
+
+## 交叉验证
+
+上面那 32 项只证明固件自己逻辑对，证明不了「网页发的东西它认」。所以还有一层：把网页真正写进串口的字节流原样存成 `frame.bin`，直接喂进 `st73_stream_feed`。
+
+```
+gcc -std=c99 -Wall -Wextra -Werror -pedantic firmware/st73_receiver.c firmware/test_cross.c -o test_cross
+./test_cross frame.bin
+```
+
+128×160 一帧正好 40969 字节（9 字节头 + 40960 像素）。`frame.bin` 的抓法：在网页上选图，用串口工具把写出去的字节原样存盘。
+
+五组场景：整块一次喂 / 逐字节喂 / 前面掺垃圾 / 校验和坏掉 / 屏幕拒收。
+
+这层验证抓到过一个真 bug：上一帧发到一半断开时，串口里残留的像素字节可能恰好是 `A5 5A`（RGB565 的 `0x5AA5` 是很常见的灰色），它会把下一帧的真同步字一起圈进 9 字节窗口，导致整帧被丢——表现就是「点一次没反应，得再点第二次」。修法见 `f447c2b`：校验失败后在窗口内回退重扫。
 
 ## 和上一版的关系
 
