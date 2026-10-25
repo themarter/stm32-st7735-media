@@ -4,6 +4,48 @@
  * 避免写屏期间 4 KiB 环形缓冲被灌满。 */
 #define ST73_WRITE_SLICE 1024u
 
+/* 帧头校验没过时，这 9 个字节里可能还藏着真正的同步字。
+ *
+ * 典型情况：上一帧发到一半断开，串口里残留的像素字节恰好是 A5 5A
+ * （RGB565 里 0x5AA5 是很常见的灰色），接上下一帧时，这个假同步字
+ * 会把真帧的 A5 5A 一起圈进窗口 —— 直接清零就整帧丢了，用户看到的是
+ * 「点一次没反应，得再点一次」。
+ *
+ * 所以从窗口第 2 个字节往回找下一个 A5 5A，把尾巴搬到开头继续接。
+ * 找不到成对的，退一步只找落单的 A5（下一字节可能正好是 5A）。 */
+static void resync_within_header(ST73_Stream *s)
+{
+    uint8_t i;
+    uint8_t keep = 0u;
+    uint8_t tail;
+
+    for (i = 1u; (uint8_t)(i + 1u) < ST73_HEADER_SIZE; ++i) {
+        if (s->header[i] == ST73_SYNC0 && s->header[i + 1u] == ST73_SYNC1) {
+            keep = i;
+            break;
+        }
+    }
+    if (keep == 0u) {
+        for (i = 1u; i < ST73_HEADER_SIZE; ++i) {
+            if (s->header[i] == ST73_SYNC0) {
+                keep = i;
+                break;
+            }
+        }
+    }
+
+    if (keep == 0u) {
+        s->header_len = 0u;
+        return;
+    }
+
+    tail = (uint8_t)(ST73_HEADER_SIZE - keep);
+    for (i = 0u; i < tail; ++i) {
+        s->header[i] = s->header[i + keep];
+    }
+    s->header_len = tail;
+}
+
 static void begin_frame(ST73_Stream *s)
 {
     const uint8_t *h = s->header;
@@ -21,12 +63,14 @@ static void begin_frame(ST73_Stream *s)
     hgt = (uint16_t)((uint16_t)h[5] | ((uint16_t)h[6] << 8));
     ori = (uint8_t)(h[7] & 3u);
 
-    s->header_len = 0u;
-
-    /* 命令或校验不对就当没看见，继续找下一个同步字。 */
+    /* 命令或校验不对就当没看见，继续找下一个同步字。
+     * 注意这里不能直接把 header_len 清零：窗口里可能还含着真帧的同步字。 */
     if (h[2] != ST73_CMD_IMAGE || sum != h[8] || w == 0u || hgt == 0u) {
+        resync_within_header(s);
         return;
     }
+
+    s->header_len = 0u;
 
     s->width       = w;
     s->height      = hgt;
